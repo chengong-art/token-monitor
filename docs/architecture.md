@@ -28,6 +28,8 @@ Only the app, agent and packaging scripts run `ensure:tokscale`, which installs 
 
 ## Collector pipeline
 
+The offline [cloud usage import prototype](cloud-usage-import.md) is a separate reporting boundary. Its account/workspace aggregates and normalized cloud task ledger never enter the local collector, archives, device wire record or Hub totals. An execution origin of `unknown` is not cloud attribution; imported reports explicitly forbid combining with local usage until an authorized source provides reconcilable metering identities.
+
 `src/shared/collector.js` owns every tokscale scan and the binary resolution behind it; self-sync spawns take its resolver rather than repeating it. `src/shared/clientSources.js` resolves host source roots (including exact-file watch parents and Copilot's canonical exporter path); `src/shared/clientSourceObservations.js` probes those roots and projects them into source checks and diagnostics, while the collector owns watch policy and derives status from the same checks. Keep the exporter root, ignore policy and attribution on the same canonical path helper, or a symlink/Windows short path can make the watch and its attribution disagree.
 
 - **Serial full scans, exact watch deltas.** Full ticks run today / month / allTime serially, because concurrent scans triple peak CPU/IO. Watch ticks scan `--today` only and derive month/allTime through `applyPeriodDelta()` anchored to the last full scan. The delta is an identity for append-only logs, not an estimate; a stale-date anchor forces a full scan.

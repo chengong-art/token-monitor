@@ -1,0 +1,24 @@
+{
+  "object": "page",
+  "data": [{
+    "object": "workspace.usage.result",
+    "start_time": 1759276800,
+    "end_time": 1759363200,
+    "user_id": "fixture-user",
+    "actor": { "type": "ACCOUNT_USER", "user_id": "fixture-user", "email": "fixture@example.test" },
+    "totals": {
+      "chats": 4,
+      "messages": 9,
+      "credits": null,
+      "cost_usd": 0.25,
+      "uncached_text_input_tokens": 110,
+      "cached_text_input_tokens": 220,
+      "text_output_tokens": 55,
+      "text_total_tokens": 385
+    },
+    "clients": [],
+    "models": []
+  }],
+  "has_more": true,
+  "next_page": "fixture-cursor"
+}
