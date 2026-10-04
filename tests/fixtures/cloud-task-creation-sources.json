@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "kind": "cloud-task-usage",
+  "records": [
+    {
+      "provider": "fixture-authority",
+      "scopeId": "fixture-scope",
+      "taskId": "fixture-manual-task",
+      "date": "2026-10-04",
+      "model": "fixture-model",
+      "revision": 1,
+      "execution": "cloud",
+      "creationSource": "manual",
+      "measurement": "reported",
+      "tokens": { "inputTokens": 100, "cachedInputTokens": 20, "outputTokens": 30, "reasoningOutputTokens": 10 }
+    },
+    {
+      "provider": "fixture-authority",
+      "scopeId": "fixture-scope",
+      "taskId": "fixture-dot-task",
+      "date": "2026-10-04",
+      "model": "fixture-model",
+      "revision": 1,
+      "execution": "cloud",
+      "creationSource": "dot",
+      "measurement": "reported",
+      "tokens": { "inputTokens": 150, "cachedInputTokens": 50, "outputTokens": 50, "reasoningOutputTokens": 20 }
+    },
+    {
+      "provider": "fixture-authority",
+      "scopeId": "fixture-scope",
+      "taskId": "fixture-unknown-task",
+      "date": "2026-10-04",
+      "model": "fixture-model",
+      "revision": 1,
+      "execution": "cloud",
+      "measurement": "reported",
+      "tokens": { "inputTokens": 10, "cachedInputTokens": 3, "outputTokens": 5, "reasoningOutputTokens": 2 }
+    }
+  ]
+}

@@ -98,6 +98,11 @@ function importFile(args) {
     temporary = `${output}.${crypto.randomUUID()}.tmp`;
     fs.writeFileSync(temporary, encoded, { flag: 'wx', mode: 0o600 });
     completion = { kind: result.kind, scope: result.report.scope, realtime: false, canCombineWithLocal: false };
+    if (args.kind === 'cloud-task') {
+      completion.taskCount = result.report.taskCount;
+      completion.creationSources = result.report.creationSources;
+      completion.attributionConflictTaskCount = result.report.attributionConflictTaskCount;
+    }
     fs.renameSync(temporary, output);
     temporary = null;
     committed = true;

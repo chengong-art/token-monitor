@@ -1,6 +1,6 @@
 # Cloud usage import prototype
 
-This fork provides an offline reporting boundary, not live dot / Work Cloud task collection. It does not register a new tracked client, alter the installed widget, or feed imported usage into the existing local collector, archives, DeviceState or Hub. See [source feasibility](cloud-usage-sources.md) for the verified official sources and their limits.
+This fork provides an offline reporting boundary for both user-created Codex cloud tasks and dot-delegated cloud tasks. It does not provide live collection, register a new tracked client, alter the installed widget, or feed imported usage into the existing local collector, archives, DeviceState or Hub. See [source feasibility](cloud-usage-sources.md) for the verified official sources and their limits.
 
 ## Run it in this checkout
 
@@ -12,7 +12,7 @@ node scripts/import-cloud-usage.js --kind codex-account \
   --input tests/fixtures/codex-account-usage.json \
   --output data/cloud-usage/account.json
 node scripts/import-cloud-usage.js --kind cloud-task \
-  --input tests/fixtures/cloud-task-usage.json \
+  --input tests/fixtures/cloud-task-creation-sources.json \
   --output data/cloud-usage/tasks.json
 ```
 
@@ -46,6 +46,7 @@ This is this fork's adapter contract, not an OpenAI export schema. A future auth
     "model": "reported-model-id",
     "revision": 1,
     "execution": "cloud",
+    "creationSource": "manual",
     "measurement": "reported",
     "tokens": {
       "inputTokens": 100,
@@ -60,6 +61,24 @@ This is this fork's adapter contract, not an OpenAI export schema. A future auth
 Each record is one cumulative daily snapshot for that task/model, not a usage event or an all-time task counter copied to multiple days. `inputTokens` includes cached input; `outputTokens` includes reasoning output. The total is exactly `inputTokens + outputTokens`. Cache and reasoning counts are subsets and must not be added again. Counters and revisions must be nonnegative safe integers (revision starts at 1), dates must be real calendar days, and subsets must not exceed their parents. Missing task usage fails validation instead of becoming zero. A source unable to provide these fields cannot use this contract; the account/workspace adapters preserve their own less detailed metrics instead.
 
 The identity is `(provider, scopeId, taskId, date, model)`, independent of import filename, device or exporter name. Use the same canonical authority and scope for exports of the same underlying meter. Two exporters assigning different authority/scope aliases can still duplicate data; an offline importer cannot prove they share a meter. Reconcile aliases in the authorized adapter before import.
+
+## Manual, dot and unknown creation sources
+
+`creationSource` identifies how a cloud task was created, separately from the location of execution or the authority reporting usage:
+
+| Value | Meaning |
+| --- | --- |
+| `manual` | The user created the Codex cloud task directly through an authorized client. |
+| `dot` | A dot delegated the cloud task. |
+| `unknown` | The export does not establish how the task was created. Missing or null source fields, including old version-1 ledgers, retain this classification. |
+
+Both known creation sources use the same import contract and counting rules. There is no dot-only provider filter, task-name rule, or implicit manual fallback. The importer cannot verify these declarations from a title, opaque task ID, account total or locally visible log. A future source adapter must establish the cloud execution and actual token counters for either creation mechanism before producing the normalized contract.
+
+Creation source is deliberately absent from the metering key. Reimporting the same underlying task through a manual-labelled export and a dot-labelled export cannot create a second token bucket. Source evidence is resolved for the whole `(provider, scopeId, taskId)` across dates, models and revisions. Unknown labels do not replace a single known source. Contradictory `manual`/`dot` declarations produce `creationSource: "unknown"` and `creationSourceConflict: true`, while usage is still counted once from the winning counter revision. That conflict persists across later imports rather than being cleared by a new label. A true conflict flag requires an unknown source.
+
+The task report has mutually exclusive `creationSources.manual`, `.dot` and `.unknown` buckets, each with task count, snapshot count and tokens. Their token sum equals the deduplicated task total. `taskCount` and `attributionConflictTaskCount` count unique authority/scope/task identities, not models or days. Even a stale counter snapshot may contribute source evidence; it never replaces the winning counters. Source conflict and counter conflict remain different: contradictory counts at the same retained revision still reject the import atomically.
+
+The CLI's successful cloud-task result shows this source breakdown. It is a report of imported declarations; it does not certify live access to either type of cloud task. The existing widget is not given synthetic sessions or inferred usage. Account/workspace reports remain execution-unknown aggregates and are never allocated to manual or dot tasks.
 
 Equal revisions with equal counters are idempotent. A higher revision replaces the snapshot, including an authoritative downward correction. A lower revision is ignored. Conflicting counters for the same revision within the batch or against the retained revision fail the complete transaction, preserving the previous file. Older revisions discarded by a prior import are not retained as an audit history. Unknown fields are discarded, so prompts, titles, emails and authentication data are not copied into output. This is field minimization, not a guarantee that an identifier or other accepted string contains no sensitive data.
 
@@ -80,4 +99,4 @@ node --test tests/shared/cloudUsageImport.test.js \
 npm run verify
 ```
 
-Unit tests cover unknown versus zero, official report shapes, rejected thread estimates, safe integer/date validation, idempotence, revision replacement/correction, conflicts, scope isolation and field minimization. CLI tests exercise repeated imports, file persistence, failed-import rollback, report-kind separation, locks, alias rejection and private output permissions. Real account source availability and the remaining cloud task blocker are recorded in [the source report](cloud-usage-sources.md); fixture tests do not establish a real dot task-to-usage join.
+Unit tests cover unknown versus zero, official report shapes, rejected thread estimates, safe integer/date validation, idempotence, revision replacement/correction, conflicts, scope isolation and field minimization. CLI tests exercise both manual and dot task imports, missing/unknown/conflicting creation sources, cross-source deduplication, repeated imports, file persistence, failed-import rollback, report-kind separation, locks, alias rejection and private output permissions. Real account source availability and the remaining cloud task blocker are recorded in [the source report](cloud-usage-sources.md); these synthetic fixtures do not establish a real task-to-usage join for either creation mechanism.

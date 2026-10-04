@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const { normalizeCodexAccountUsage, importCloudTaskUsage } = require('../../src/shared/cloudUsageImport');
+const { normalizeChatgptDailyUsage } = require('../../src/shared/chatgptDailyUsageImport');
 
 function tokens(overrides = {}) {
   return { inputTokens: 10, cachedInputTokens: 3, outputTokens: 5, reasoningOutputTokens: 2, ...overrides };
@@ -96,8 +97,14 @@ test('cloud report counts input plus output once, with cached/reasoning subsets 
   const result = importCloudTaskUsage(envelope([record(), record({ taskId: 'task-b', date: '2026-10-03', tokens: tokens({ inputTokens: 20, cachedInputTokens: 20, outputTokens: 10, reasoningOutputTokens: 10 }) })]));
   assert.deepEqual(result.report, {
     source: 'cloud-task-import', scope: 'task-day', execution: 'cloud', measurement: 'reported',
-    realtime: false, canCombineWithLocal: false, recordCount: 2, totalTokens: 45,
+    realtime: false, canCombineWithLocal: false, taskCount: 2, recordCount: 2, totalTokens: 45,
     inputTokens: 30, cachedInputTokens: 23, outputTokens: 15, reasoningOutputTokens: 12,
+    creationSources: {
+      manual: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+      dot: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+      unknown: { taskCount: 2, recordCount: 2, totalTokens: 45 }
+    },
+    attributionConflictTaskCount: 0,
     daily: [{ date: '2026-10-03', totalTokens: 30 }, { date: '2026-10-04', totalTokens: 15 }]
   });
 });
@@ -267,4 +274,257 @@ test('records arrays and merged ledgers are bounded to 10000 snapshots', () => {
   assert.throws(() => importCloudTaskUsage(envelope([record({ taskId: 'another-task' })]), baseline), /10000/);
   assert.throws(() => importCloudTaskUsage(envelope(), { ...baseline, records: [...records, record()] }), /10000/);
   assert.equal(importCloudTaskUsage(envelope([record({ taskId: 'task-0', revision: 2, tokens: zeroTokens })]), baseline).report.recordCount, 10000);
+});
+
+test('manual and dot synthetic cloud snapshots remain independent and partition deduplicated totals', () => {
+  // Invented offline values exercise the adapter contract, not live task usage.
+  const result = importCloudTaskUsage(envelope([
+    record({ taskId: 'manual-fixture', creationSource: 'manual' }),
+    record({ taskId: 'manual-fixture', creationSource: 'manual', date: '2026-10-03',
+      tokens: tokens({ inputTokens: 20, cachedInputTokens: 5, outputTokens: 10 }) }),
+    record({ taskId: 'dot-fixture', creationSource: 'dot',
+      tokens: tokens({ inputTokens: 20, cachedInputTokens: 2, outputTokens: 10 }) }),
+    record({ taskId: 'unknown-fixture' })
+  ]));
+  assert.equal(result.report.taskCount, 3);
+  assert.equal(result.report.recordCount, 4);
+  assert.equal(result.report.totalTokens, 90);
+  assert.deepEqual(result.report.creationSources, {
+    manual: { taskCount: 1, recordCount: 2, totalTokens: 45 },
+    dot: { taskCount: 1, recordCount: 1, totalTokens: 30 },
+    unknown: { taskCount: 1, recordCount: 1, totalTokens: 15 }
+  });
+  assert.equal(result.report.attributionConflictTaskCount, 0);
+  for (const row of result.records) {
+    assert.equal(row.execution, 'cloud');
+    assert.equal(row.creationSourceConflict, false);
+  }
+  for (const field of ['taskCount', 'recordCount', 'totalTokens']) {
+    assert.equal(Object.values(result.report.creationSources).reduce((sum, bucket) => sum + bucket[field], 0), result.report[field]);
+  }
+});
+
+test('absent, null, undefined and explicit unknown creation sources normalize without guessing from metadata', () => {
+  for (const raw of [record(), record({ creationSource: null }), record({ creationSource: undefined }), record({ creationSource: 'unknown' })]) {
+    raw.title = 'Manually created dot-delegated task';
+    raw.source = 'manual';
+    raw.provider = 'dot-provider';
+    raw.taskId = 'manual-task';
+    raw.localPresence = true;
+    const result = importCloudTaskUsage(envelope([raw]));
+    assert.equal(result.records[0].creationSource, 'unknown');
+    assert.equal(result.records[0].creationSourceConflict, false);
+    assert.deepEqual(result.report.creationSources.unknown, { taskCount: 1, recordCount: 1, totalTokens: 15 });
+    assert.equal(result.report.attributionConflictTaskCount, 0);
+    assert.equal(Object.hasOwn(result.records[0], 'localPresence'), false);
+    assert.equal(Object.hasOwn(result.records[0], 'source'), false);
+    assert.equal(Object.hasOwn(result.records[0], 'title'), false);
+  }
+});
+
+test('legacy version-one ledgers gain unknown attribution and ignore untrusted prior source summaries', () => {
+  const previous = importCloudTaskUsage(envelope([record()]));
+  delete previous.records[0].creationSource;
+  delete previous.records[0].creationSourceConflict;
+  previous.report.creationSources = { manual: { taskCount: 999, recordCount: 999, totalTokens: 999 } };
+  previous.report.attributionConflictTaskCount = 999;
+  const untouched = JSON.stringify(previous);
+  const result = importCloudTaskUsage(envelope(), previous);
+  assert.equal(result.version, 1);
+  assert.equal(result.records[0].creationSource, 'unknown');
+  assert.equal(result.records[0].creationSourceConflict, false);
+  assert.deepEqual(result.report.creationSources, {
+    manual: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+    dot: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+    unknown: { taskCount: 1, recordCount: 1, totalTokens: 15 }
+  });
+  assert.equal(result.report.attributionConflictTaskCount, 0);
+  assert.equal(JSON.stringify(previous), untouched);
+});
+
+test('invalid or ambiguous creation labels and malformed conflict markers are rejected atomically', () => {
+  const baseline = importCloudTaskUsage(envelope([record()]));
+  const untouched = JSON.stringify(baseline);
+  for (const creationSource of ['local', 'ambiguous', 'manual/dot', 'Manual', '', true, 1, [], {}]) {
+    assert.throws(() => importCloudTaskUsage(envelope([record({ creationSource })]), baseline), /creationSource must be/);
+  }
+  for (const creationSourceConflict of [null, 'true', 'false', 0, 1, {}, []]) {
+    assert.throws(() => importCloudTaskUsage(envelope([record({ creationSourceConflict })]), baseline), /creationSourceConflict must be boolean/);
+  }
+  for (const creationSource of ['manual', 'dot']) {
+    assert.throws(() => importCloudTaskUsage(envelope([record({ creationSource, creationSourceConflict: true })]), baseline), /requires unknown/);
+  }
+  const invalidPrevious = { ...baseline, records: [record({ creationSource: 'local' })] };
+  assert.throws(() => importCloudTaskUsage(envelope([record({ revision: 2 })]), invalidPrevious), /creationSource must be/);
+  assert.equal(JSON.stringify(baseline), untouched);
+});
+
+test('creation source never participates in snapshot identity or counter conflict rules', () => {
+  const manual = record({ creationSource: 'manual' });
+  const dot = record({ creationSource: 'dot' });
+  const result = importCloudTaskUsage(envelope([manual, dot, record()]));
+  assert.equal(result.report.taskCount, 1);
+  assert.equal(result.report.recordCount, 1);
+  assert.equal(result.report.totalTokens, 15);
+  assert.equal(result.records[0].creationSource, 'unknown');
+  assert.equal(result.records[0].creationSourceConflict, true);
+  assert.deepEqual(result.report.creationSources.unknown, { taskCount: 1, recordCount: 1, totalTokens: 15 });
+  assert.equal(result.report.attributionConflictTaskCount, 1);
+  assert.deepEqual(importCloudTaskUsage(envelope([dot, manual])), result);
+  assert.deepEqual(importCloudTaskUsage(envelope([manual, dot]), result), result);
+});
+
+test('unknown snapshots are enriched by known source declarations across imports and stale revisions', () => {
+  const baseline = importCloudTaskUsage(envelope([
+    record({ revision: 5 }), record({ model: 'another-model', date: '2026-10-03' })
+  ]));
+  const stale = record({ creationSource: 'manual', revision: 1,
+    tokens: tokens({ inputTokens: 1, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }) });
+  const enriched = importCloudTaskUsage(envelope([stale]), baseline);
+  assert.equal(enriched.report.totalTokens, 30);
+  assert.equal(enriched.records.find(row => row.model === 'gpt-example').revision, 5);
+  assert.ok(enriched.records.every(row => row.creationSource === 'manual' && row.creationSourceConflict === false));
+  assert.deepEqual(enriched.report.creationSources.manual, { taskCount: 1, recordCount: 2, totalTokens: 30 });
+  assert.equal(enriched.report.creationSources.unknown.totalTokens, 0);
+  assert.ok(baseline.records.every(row => row.creationSource === 'unknown'));
+  const sameRevision = importCloudTaskUsage(envelope([record(), record({ creationSource: 'dot' })]));
+  assert.equal(sameRevision.records[0].creationSource, 'dot');
+  assert.equal(sameRevision.report.totalTokens, 15);
+  assert.deepEqual(importCloudTaskUsage(envelope([record({ creationSource: 'dot' }), record()])), sameRevision);
+});
+
+test('unknown later labels cannot erase known attribution while higher counter revisions still replace snapshots', () => {
+  const baseline = importCloudTaskUsage(envelope([record({ creationSource: 'manual' })]));
+  const grown = importCloudTaskUsage(envelope([record({ revision: 2, creationSource: null,
+    tokens: tokens({ inputTokens: 30, outputTokens: 20 }) })]), baseline);
+  assert.equal(grown.report.totalTokens, 50);
+  assert.equal(grown.records[0].creationSource, 'manual');
+  assert.equal(grown.records[0].creationSourceConflict, false);
+  assert.deepEqual(grown.report.creationSources.manual, { taskCount: 1, recordCount: 1, totalTokens: 50 });
+  const corrected = importCloudTaskUsage(envelope([record({ revision: 3, creationSource: 'dot',
+    tokens: tokens({ inputTokens: 3, cachedInputTokens: 1, outputTokens: 2, reasoningOutputTokens: 0 }) })]), grown);
+  assert.equal(corrected.report.totalTokens, 5);
+  assert.equal(corrected.report.recordCount, 1);
+  assert.equal(corrected.records[0].revision, 3);
+  assert.equal(corrected.records[0].creationSource, 'unknown');
+  assert.equal(corrected.records[0].creationSourceConflict, true);
+  assert.deepEqual(corrected.report.creationSources.unknown, { taskCount: 1, recordCount: 1, totalTokens: 5 });
+  assert.equal(corrected.report.attributionConflictTaskCount, 1);
+});
+
+test('conflicting declarations across dates and models mark every winning snapshot of that task unknown', () => {
+  const baseline = importCloudTaskUsage(envelope([
+    record({ creationSource: 'manual' }), record({ taskId: 'unrelated', creationSource: 'dot' })
+  ]));
+  const result = importCloudTaskUsage(envelope([
+    record({ creationSource: 'dot', date: '2026-10-03' }),
+    record({ model: 'another-model', creationSource: 'unknown' })
+  ]), baseline);
+  const conflicted = result.records.filter(row => row.taskId === 'task-a');
+  assert.equal(conflicted.length, 3);
+  assert.ok(conflicted.every(row => row.creationSource === 'unknown' && row.creationSourceConflict === true));
+  assert.equal(result.records.find(row => row.taskId === 'unrelated').creationSource, 'dot');
+  assert.equal(result.records.find(row => row.taskId === 'unrelated').creationSourceConflict, false);
+  assert.equal(result.report.taskCount, 2);
+  assert.equal(result.report.totalTokens, 60);
+  assert.deepEqual(result.report.creationSources.unknown, { taskCount: 1, recordCount: 3, totalTokens: 45 });
+  assert.deepEqual(result.report.creationSources.dot, { taskCount: 1, recordCount: 1, totalTokens: 15 });
+  assert.equal(result.report.attributionConflictTaskCount, 1);
+});
+
+test('stale counter snapshots can disclose a whole-task attribution conflict without changing the winning counters', () => {
+  const baseline = importCloudTaskUsage(envelope([record({ revision: 5, creationSource: 'manual' })]));
+  const result = importCloudTaskUsage(envelope([record({ revision: 1, creationSource: 'dot',
+    tokens: tokens({ inputTokens: 50 }) })]), baseline);
+  assert.equal(result.records[0].revision, 5);
+  assert.equal(result.report.totalTokens, 15);
+  assert.equal(result.records[0].creationSource, 'unknown');
+  assert.equal(result.records[0].creationSourceConflict, true);
+  assert.equal(result.report.attributionConflictTaskCount, 1);
+});
+
+test('attribution conflicts survive ledger serialization and cannot be erased by a later known declaration', () => {
+  let ledger = importCloudTaskUsage(envelope([record({ creationSource: 'manual' }), record({ creationSource: 'dot' })]));
+  ledger = JSON.parse(JSON.stringify(ledger));
+  for (const incoming of [[], [record({ creationSource: 'manual', revision: 2 })],
+    [record({ creationSource: 'dot', model: 'another-model' })], [record({ creationSource: 'unknown', revision: 3 })]]) {
+    ledger = importCloudTaskUsage(envelope(incoming), ledger);
+    assert.ok(ledger.records.every(row => row.creationSource === 'unknown' && row.creationSourceConflict === true));
+    assert.equal(ledger.report.attributionConflictTaskCount, 1);
+    assert.equal(ledger.report.creationSources.manual.totalTokens, 0);
+    assert.equal(ledger.report.creationSources.dot.totalTokens, 0);
+    assert.equal(ledger.report.creationSources.unknown.totalTokens, ledger.report.totalTokens);
+  }
+  const flagged = importCloudTaskUsage(envelope([
+    record({ creationSourceConflict: true }), record({ model: 'another-model', creationSource: 'manual' })
+  ]));
+  assert.ok(flagged.records.every(row => row.creationSource === 'unknown' && row.creationSourceConflict === true));
+  assert.equal(flagged.report.attributionConflictTaskCount, 1);
+});
+
+test('task attribution keys isolate authorities and scopes and do not collide on embedded delimiters', () => {
+  const result = importCloudTaskUsage(envelope([
+    record({ creationSource: 'manual' }), record({ scopeId: 'workspace-b', creationSource: 'dot' }),
+    record({ provider: 'another-authority', creationSource: 'dot' }),
+    record({ provider: 'a,b', scopeId: 'c', creationSource: 'manual' }),
+    record({ provider: 'a', scopeId: 'b,c', creationSource: 'dot' })
+  ]));
+  assert.equal(result.report.taskCount, 5);
+  assert.equal(result.report.attributionConflictTaskCount, 0);
+  assert.deepEqual(result.report.creationSources.manual, { taskCount: 2, recordCount: 2, totalTokens: 30 });
+  assert.deepEqual(result.report.creationSources.dot, { taskCount: 3, recordCount: 3, totalTokens: 45 });
+  assert.ok(result.records.every(row => row.creationSourceConflict === false));
+});
+
+test('same-revision counter conflicts remain atomic when creation declarations also differ', () => {
+  const baseline = importCloudTaskUsage(envelope([record({ creationSource: 'manual' })]));
+  const untouched = JSON.stringify(baseline);
+  assert.throws(() => importCloudTaskUsage(envelope([
+    record({ taskId: 'new-task', creationSource: 'dot' }),
+    record({ creationSource: 'dot', tokens: tokens({ inputTokens: 11 }) })
+  ]), baseline), /conflicting counts/);
+  assert.equal(JSON.stringify(baseline), untouched);
+  assert.equal(baseline.records[0].creationSource, 'manual');
+  assert.equal(baseline.records[0].creationSourceConflict, false);
+});
+
+test('source buckets preserve maximum safe counts and fail overflowing imports without changing attribution', () => {
+  const maximum = record({ creationSource: 'manual', tokens: tokens({ inputTokens: Number.MAX_SAFE_INTEGER,
+    cachedInputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 0, reasoningOutputTokens: 0 }) });
+  const zero = record({ taskId: 'dot-task', creationSource: 'dot',
+    tokens: tokens({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, reasoningOutputTokens: 0 }) });
+  const baseline = importCloudTaskUsage(envelope([maximum, zero]));
+  assert.equal(baseline.report.totalTokens, Number.MAX_SAFE_INTEGER);
+  assert.deepEqual(baseline.report.creationSources.manual, { taskCount: 1, recordCount: 1, totalTokens: Number.MAX_SAFE_INTEGER });
+  assert.deepEqual(baseline.report.creationSources.dot, { taskCount: 1, recordCount: 1, totalTokens: 0 });
+  const untouched = JSON.stringify(baseline);
+  assert.throws(() => importCloudTaskUsage(envelope([record({ taskId: 'another-task', creationSource: 'dot' })]), baseline), RangeError);
+  assert.equal(JSON.stringify(baseline), untouched);
+});
+
+test('manual and dot declarations do not make missing usage or local execution importable', () => {
+  for (const creationSource of ['manual', 'dot']) {
+    assert.throws(() => importCloudTaskUsage(envelope([record({ creationSource, tokens: undefined })])), /tokens must be an object/);
+    assert.throws(() => importCloudTaskUsage(envelope([record({ creationSource, execution: 'local' })])), /execution must be cloud/);
+    assert.throws(() => importCloudTaskUsage(envelope([{ creationSource, taskId: 'metadata-only', title: 'Synthetic task' }])), TypeError);
+  }
+});
+
+test('account and workspace DTOs never turn creation declarations or aggregate totals into task attribution', () => {
+  const account = normalizeCodexAccountUsage({
+    summary: { lifetimeTokens: 15, peakDailyTokens: 15, creationSource: 'manual' },
+    dailyUsageBuckets: [{ startDate: '2026-10-04', tokens: 15, creationSource: 'dot', taskId: 'synthetic-task' }],
+    creationSource: 'manual'
+  });
+  const workspace = normalizeChatgptDailyUsage({ object: 'page', has_more: false, next_page: null,
+    creationSource: 'dot', data: [{ object: 'workspace.usage.result', start_time: 0, end_time: 86400,
+      creationSource: 'manual', taskId: 'synthetic-task', totals: { text_total_tokens: 15 } }] });
+  for (const report of [account, workspace]) {
+    assert.equal(report.execution, 'unknown');
+    assert.equal(Object.hasOwn(report, 'creationSource'), false);
+    assert.equal(Object.hasOwn(report, 'creationSources'), false);
+    assert.equal(Object.hasOwn(report, 'taskCount'), false);
+    assert.equal(JSON.stringify(report).includes('synthetic-task'), false);
+    assert.throws(() => importCloudTaskUsage(report), /envelope must have version/);
+  }
 });

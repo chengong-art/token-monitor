@@ -2,7 +2,7 @@
 
 Checked on **2026-10-04** against fetched official OpenAI documentation, the public Admin API reference and its [raw OpenAPI schema](https://chatgpt.com/public/admin/api-reference/openapi.json) (`openapi: 3.0.2`, `info.version: 2.5.37`). Codex source links below are pinned to `afb436df8b70bb5bc57b86d9a3e829968988cd21`, the default-branch revision returned during this check. No private logs, credentials, or authenticated usage exports were used for this research.
 
-Official reporting exists, but this check does **not** establish access to actual usage for each dot-delegated cloud task. Account and workspace aggregates, thread estimates, active engine events, and local log collection have different coverage. This offline adapter does not provide live cloud-task statistics.
+Official reporting exists, but this check does **not** establish access to actual usage for each dot-delegated cloud task or manually started Codex Cloud task. Account and workspace aggregates, thread estimates, active engine events, and local log collection have different coverage. This offline adapter does not provide live cloud-task statistics.
 
 ## Candidate sources
 
@@ -16,6 +16,28 @@ Official reporting exists, but this check does **not** establish access to actua
 | Existing local collector | Scans local sources using the repository's existing collector. | A locally visible thread or synced cloud task title does not prove that the cloud execution's token events exist locally. Source locations and execution locations must remain separate. |
 
 Rate-limit percentages from `account/rateLimits/read` represent quota windows, not token counters. Credit usage, token usage, estimated USD, and invoices also remain distinct; see [Work usage and cost](https://learn.chatgpt.com/docs/enterprise/chatgpt-work-usage-and-cost).
+
+## Manually started Codex Cloud tasks versus dot delegation
+
+This scope extension was checked on **2026-10-04** by fetching the official [Codex Cloud guide](https://learn.chatgpt.com/docs/cloud), [cloud environments guide](https://learn.chatgpt.com/docs/environments/cloud-environments), [CLI command reference](https://learn.chatgpt.com/docs/developer-commands#codex-cloud), and [app-server API overview](https://learn.chatgpt.com/docs/app-server#api-overview), with the same pinned public Codex revision above. No cloud task was created, model turn started, or new credential provisioned for this check.
+
+Users can start a cloud task themselves by selecting **Work in > Cloud** and an environment in the web or desktop UI, or by selecting an environment in mobile Codex. The CLI also documents `codex cloud exec` as task submission using existing CLI authentication. Submission may start model work, so it was not used as a usage probe. The pinned [CLI declaration](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/cloud-tasks/src/cli.rs) has `exec`, `list`, `status`, `diff`, and `apply`, but no distinct `create` subcommand.
+
+| Authorized interface | Exposed data and coverage limit |
+| --- | --- |
+| `codex cloud exec --env <ENV_ID>` | Submits a new task and returns its task URL/identity. This is a creation operation, not a token-usage query. |
+| `codex cloud list --json` | Returns `tasks` and an optional `cursor`. Rows expose `id`, `url`, `title`, `status`, `updated_at`, environment identity/label, a changed-file/line summary, review flag, and attempt count. No token counters or manual/dot creation-origin discriminator appear in the documented response. |
+| `codex cloud status <TASK_ID>` | Reads a task summary and formats status. The public implementation can exit with status 1 for a task that is not ready; that exit code alone is not proof of authentication failure. The exposed summary has no token counters. |
+| `codex cloud diff <TASK_ID> [--attempt <N>]` | Reads and prints the selected attempt's diff. A diff, message, or attempt count does not determine actual tokens. |
+| App-server `thread/read`, `thread/list`, and token events | The fetched public API describes stored threads and active engine events. It does not establish a universal cloud-task inventory or a documented mapping from these CLI cloud task IDs to app-server thread IDs. Per-thread estimates described above remain estimates. |
+
+The list command was documented directly. Dedicated status/diff documentation anchors were not found in the fetched command reference; their behavior was checked against pinned [public CLI implementation](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/cloud-tasks/src/lib.rs) and [public task/attempt types](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/cloud-tasks-client/src/api.rs). Those metadata types expose no task token-usage field. Private backend routes were not called or adopted as an integration contract.
+
+The current cloud guide distinguishes the current and Legacy Codex Cloud experiences. The CLI reference does not prove that its list exhaustively covers every task created through the current web, mobile, desktop, or dot delegation paths. That coverage needs verification against actual authorized tasks; task visibility must not be inferred from account totals.
+
+A separate sanitized live check used the existing authenticated bundled Codex CLI **0.160.0** with `codex cloud list --json --limit 1`: the request succeeded and returned an empty task list. No model task was started, and no raw response, account identity, or task title was saved. This proves that this list method was callable with current authentication. An empty list cannot verify any individual manual or dot task's visibility, creation origin, token fields, or task-to-thread join.
+
+Both creation paths therefore share the remaining requirement: a supported, authorized source that supplies actual tokens with verifiable task/run identities and execution coverage. Neither account daily buckets nor workspace Daily Usage aggregates can be assigned to an individual manually started or dot-delegated task. The task ID to app-server thread ID join and the exact semantics of any per-thread response remain unverified for both paths. Creation-origin labels record provenance; they are not a usage identity and must not cause the same task observed through two paths to be counted twice.
 
 ## Exact Daily Usage input
 
@@ -66,11 +88,11 @@ The isolated implementation starts from upstream `189d54da7c74ebc605530f505185df
 | Check | Result |
 | --- | --- |
 | Real source read | The bundled Codex CLI 0.160.0 accepted the documented initialize handshake and `account/usage/read`. It returned numeric lifetime/peak metrics and daily buckets. The actual response passed `normalizeCodexAccountUsage` in memory. No raw response, account identity or actual counter values are committed. No model turn was started. |
-| Cloud-task attribution | Still unverified. The real account response has no validated cloud/local or individual dot-task join. No per-thread estimate was queried or imported. |
+| Cloud-task attribution | Still unverified for both manual and dot creation. The real account response has no validated cloud/local or individual task join; the authorized CLI list returned no tasks. No per-thread estimate was queried or imported. |
 | Workspace authorization | Public schema verified; the current account's workspace Admin scope and endpoint entitlement were not verified. No Admin key was created or stored. Workspace tests use synthetic fixtures. |
-| New adapter and CLI checks | 39 tests pass: official report projections, unknown/zero distinctions, duplicate snapshots, revisions and downward correction, conflicts and file rollback, subset counting, unsafe values, privacy projection, pagination, alias/lock handling, and successful commit status despite cleanup failure. |
-| Required repository verification | `npm run verify` passes on Node.js 25.9.0: lint passes, 5,747 tests pass, 2 are skipped, none fail. Existing loopback/process/native-watcher integration tests require host permissions rather than the restrictive sandbox; no persistent security setting was changed. |
+| New adapter and CLI checks | 56 tests pass: official report projections, unknown/zero distinctions, manual/dot/unknown declarations, task-wide attribution conflicts and persistence, cross-source duplicate snapshots, revisions and downward correction, conflicts and file rollback, subset counting, unsafe values, privacy projection, pagination, alias/lock handling, and successful commit status despite cleanup failure. These are synthetic offline tests, including CLI file-to-ledger round trips, not a live manual/dot task measurement. |
+| Required repository verification | `npm run verify` passes on Node.js 25.9.0: lint passes, 5,764 tests pass, 2 are skipped, none fail. Existing loopback/process/native-watcher integration tests require host permissions rather than the restrictive sandbox; no persistent security setting was changed. |
 | Generated Worker state | `npm run update:hub-build` reports the registry current and synchronizes the closure without generated-file changes. The offline import modules do not enter that closure or the Hub totals. |
-| Independent review | Source semantics and CLI persistence were reviewed separately. The identified post-commit lock-cleanup status issue was corrected and covered by tests before the final full verification. |
+| Independent review | Source semantics, task-level attribution/counting and CLI persistence were reviewed separately. The identified post-commit lock-cleanup status issue was corrected and covered by tests before the final full verification. |
 
-The delivered feature is an offline import and adaptation boundary. A supported, authorized source with actual dot/cloud task attribution, exact token semantics, and reconcilable identities is still needed before wiring a live collector or combining cloud usage with local totals. This is a source/provenance gap, not a claim that no reporting APIs exist.
+The delivered feature is an offline import and adaptation boundary. A supported, authorized source with actual dot-delegated or manually started cloud task attribution, exact token semantics, and reconcilable identities is still needed before wiring a live collector or combining cloud usage with local totals. This is a source/provenance gap, not a claim that no reporting APIs exist.

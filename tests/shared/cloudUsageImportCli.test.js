@@ -11,6 +11,7 @@ const { importFile } = require('../../scripts/import-cloud-usage');
 const ROOT = path.resolve(__dirname, '../..');
 const CLI = path.join(ROOT, 'scripts/import-cloud-usage.js');
 const TASK = path.join(ROOT, 'tests/fixtures/cloud-task-usage.json');
+const SOURCES = path.join(ROOT, 'tests/fixtures/cloud-task-creation-sources.json');
 const ACCOUNT = path.join(ROOT, 'tests/fixtures/codex-account-usage.json');
 const WORKSPACE = path.join(ROOT, 'tests/fixtures/chatgpt-daily-usage.json');
 
@@ -30,7 +31,13 @@ test('CLI persists a cloud ledger, reimport is idempotent, and a revision replac
   const first = run('cloud-task', TASK, output);
   assert.equal(first.status, 0, first.stderr);
   assert.deepEqual(JSON.parse(first.stdout), {
-    kind: 'cloud-task-usage-ledger', scope: 'task-day', realtime: false, canCombineWithLocal: false
+    kind: 'cloud-task-usage-ledger', scope: 'task-day', realtime: false, canCombineWithLocal: false,
+    taskCount: 1, attributionConflictTaskCount: 0,
+    creationSources: {
+      manual: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+      dot: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+      unknown: { taskCount: 1, recordCount: 1, totalTokens: 130 }
+    }
   });
   const before = fs.readFileSync(output, 'utf8');
   assert.equal(run('cloud-task', TASK, output).status, 0);
@@ -63,6 +70,66 @@ test('invalid or conflicting input leaves the previous output intact and removes
   const failed = run('cloud-task', input, output);
   assert.equal(failed.status, 1);
   assert.equal(failed.stderr.includes('private-fixture-text'), false);
+  assert.equal(fs.readFileSync(output, 'utf8'), before);
+});
+
+test('CLI shows manual, dot and missing creation sources without splitting a repeated task', (t) => {
+  const dir = setup(t);
+  const output = path.join(dir, 'ledger.json');
+  const first = run('cloud-task', SOURCES, output);
+  assert.equal(first.status, 0, first.stderr);
+  const initial = JSON.parse(first.stdout);
+  assert.equal(initial.taskCount, 3);
+  assert.equal(initial.attributionConflictTaskCount, 0);
+  assert.deepEqual(initial.creationSources, {
+    manual: { taskCount: 1, recordCount: 1, totalTokens: 130 },
+    dot: { taskCount: 1, recordCount: 1, totalTokens: 200 },
+    unknown: { taskCount: 1, recordCount: 1, totalTokens: 15 }
+  });
+  const saved = fs.readFileSync(output, 'utf8');
+  assert.equal(run('cloud-task', SOURCES, output).status, 0);
+  assert.equal(fs.readFileSync(output, 'utf8'), saved);
+  const envelope = JSON.parse(fs.readFileSync(SOURCES, 'utf8'));
+  const duplicate = { version: 1, kind: 'cloud-task-usage', records: [{ ...envelope.records[0], creationSource: 'dot' }] };
+  const input = path.join(dir, 'another-export.json');
+  fs.writeFileSync(input, JSON.stringify(duplicate));
+  const second = run('cloud-task', input, output);
+  assert.equal(second.status, 0, second.stderr);
+  const conflicting = JSON.parse(second.stdout);
+  assert.equal(conflicting.taskCount, 3);
+  assert.equal(conflicting.attributionConflictTaskCount, 1);
+  assert.deepEqual(conflicting.creationSources, {
+    manual: { taskCount: 0, recordCount: 0, totalTokens: 0 },
+    dot: { taskCount: 1, recordCount: 1, totalTokens: 200 },
+    unknown: { taskCount: 2, recordCount: 2, totalTokens: 145 }
+  });
+  const ledger = JSON.parse(fs.readFileSync(output, 'utf8'));
+  assert.equal(ledger.report.totalTokens, 345);
+  assert.equal(ledger.report.recordCount, 3);
+  const reimport = run('cloud-task', SOURCES, output);
+  assert.equal(reimport.status, 0);
+  assert.deepEqual(JSON.parse(reimport.stdout), conflicting);
+});
+
+test('CLI does not assign account/workspace aggregates to manual or dot and rejects invalid source labels atomically', (t) => {
+  const dir = setup(t);
+  for (const [kind, fixture] of [['codex-account', ACCOUNT], ['chatgpt-workspace', WORKSPACE]]) {
+    const output = path.join(dir, `${kind}.json`);
+    const result = run(kind, fixture, output);
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(fs.readFileSync(output, 'utf8')).report;
+    assert.equal(report.execution, 'unknown');
+    assert.equal(Object.hasOwn(report, 'creationSources'), false);
+    assert.equal(Object.hasOwn(JSON.parse(result.stdout), 'creationSources'), false);
+  }
+  const output = path.join(dir, 'tasks.json');
+  assert.equal(run('cloud-task', SOURCES, output).status, 0);
+  const before = fs.readFileSync(output, 'utf8');
+  const envelope = JSON.parse(fs.readFileSync(SOURCES, 'utf8'));
+  envelope.records[0].creationSource = 'manual-or-dot';
+  const input = path.join(dir, 'invalid-source.json');
+  fs.writeFileSync(input, JSON.stringify(envelope));
+  assert.equal(run('cloud-task', input, output).status, 1);
   assert.equal(fs.readFileSync(output, 'utf8'), before);
 });
 
