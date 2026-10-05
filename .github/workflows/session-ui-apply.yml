@@ -1,0 +1,90 @@
+name: Verify unified Sessions UI
+on:
+  push:
+    branches: [work/session-ui-build-20261005]
+    paths: [.github/workflows/session-ui-apply.yml]
+permissions:
+  contents: write
+concurrency:
+  group: session-ui-correction
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: payload
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/codex-cloud-delegated-usage-20261004
+          path: app
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify transfer and apply exact reviewed patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C app rev-parse HEAD)" = 3de3c5ff7a6e3902782e4f1fedcacac077ec60c8
+          python3 - <<'PY'
+          import base64, gzip, hashlib, pathlib
+          chunks = [pathlib.Path(f'payload/.session-ui-work/parts/{i:02d}.b64').read_text().strip() for i in range(17)]
+          encoded = ''.join(chunks)
+          assert len(encoded) == 32832, 'transfer length mismatch'
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert len(patch) == 80426
+          assert hashlib.sha256(patch).hexdigest() == '7d869db54a65c9d4820da2f796747cbc7249beecee1cc4cc88ee25a9a5d3d46f', 'patch checksum mismatch'
+          pathlib.Path('/tmp/session-ui.patch').write_bytes(patch)
+          print('Exact reviewed patch verified')
+          PY
+          cd app
+          git apply --index /tmp/session-ui.patch
+          git rm docs/images/codex-cloud-dashboard.png src/electron/renderer/cloudUsagePanel.css src/electron/renderer/cloudUsagePanel.js src/electron/renderer/cloudUsageShortcut.js
+          git diff --cached --check
+      - name: Install existing project dependencies
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+      - name: Verify lint and regression suite
+        working-directory: app
+        run: |
+          set -o pipefail
+          npm run verify 2>&1 | tee "$RUNNER_TEMP/session-verify.log"
+      - name: Verify real Electron Sessions UI with fixture data
+        working-directory: app
+        env:
+          TM_SESSIONS_VERIFY_DIR: ${{ runner.temp }}/unified-ui
+        run: |
+          set -o pipefail
+          xvfb-run -a node_modules/.bin/electron --no-sandbox scripts/verify-unified-sessions.js 2>&1 | tee "$RUNNER_TEMP/session-ui.log"
+      - name: Save verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-sessions-verification
+          path: |
+            ${{ runner.temp }}/session-verify.log
+            ${{ runner.temp }}/session-ui.log
+            ${{ runner.temp }}/unified-ui/*.png
+            ${{ runner.temp }}/unified-ui/acceptance.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Commit verified UI fix to existing PR branch
+        working-directory: app
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/unified-ui/unified-sessions.png" docs/images/codex-unified-sessions.png
+          cp "$RUNNER_TEMP/unified-ui/unified-session-detail.png" docs/images/codex-unified-session-detail.png
+          git add docs/images/codex-unified-sessions.png docs/images/codex-unified-session-detail.png
+          git diff --cached --check
+          if git diff --cached --name-only | grep -E '^(\.github/|\.session-ui-work/)'; then
+            echo 'Unexpected workflow/transport change in feature patch'; exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(codex): show cloud sessions in the existing session list'
+          git push origin HEAD:refs/heads/feat/codex-cloud-delegated-usage-20261004
+          echo "Verified feature commit: $(git rev-parse HEAD)"
