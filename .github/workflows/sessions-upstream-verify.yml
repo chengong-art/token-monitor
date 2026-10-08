@@ -1,0 +1,38 @@
+name: Verify upstream Sessions landing
+on:
+  push:
+    branches: [work/pr945-upstream-integration-20261009]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Restrict verification to loopback network
+        shell: bash
+        run: echo "NODE_OPTIONS=--require=${{ github.workspace }}/.github/pr945-network-guard.cjs" >> "$GITHUB_ENV"
+      - name: Verify focused source
+        run: npm run verify 2>&1 | tee verify.log
+        shell: bash
+      - name: Verify real Electron Sessions renderer with synthetic fixtures
+        env:
+          TM_SESSIONS_VERIFY_DIR: ${{ runner.temp }}/unified-sessions-verification
+        run: xvfb-run -a node_modules/.bin/electron --no-sandbox scripts/verify-unified-sessions.js 2>&1 | tee ui-smoke.log
+        shell: bash
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unified-sessions-upstream-verification
+          path: |
+            verify.log
+            ui-smoke.log
+            ${{ runner.temp }}/unified-sessions-verification/*.json
+            ${{ runner.temp }}/unified-sessions-verification/*.png
+          retention-days: 30
